@@ -69,7 +69,7 @@ Section('lr', 'lr scheduling').params(
 )
 
 Section('loss', 'loss function ablation').params(
-    loss=Param(OneOf(['ova', 'sigmoid', 'ce']), 'type of objective function', default='ce'),
+    loss=Param(OneOf(['sigmoid', 'ce']), 'type of objective function', default='ce'),
     mu=Param(float, 'weight of the negative heads class logits', default=0),
     lmbd=Param(float, 'weight of the negative heads sigmoid loss', default=0),
 )
@@ -150,46 +150,18 @@ class SigmoidLoss(ch.nn.Module):
         self.num_classes = num_classes
         self.mu, self.lmbd = mu, lmbd
 
-    def forward(self, logits, targets, charges=None):
+    def forward(self, logits, targets):
         hot1 = F.one_hot(targets, num_classes=self.num_classes).float()
+        l = ch.nn.functional.binary_cross_entropy_with_logits(logits, hot1, reduction='sum')
         bs = logits.size(0)
-        if charges is None: # Ugly
-            l = ch.nn.functional.binary_cross_entropy_with_logits(logits, hot1)
-            l = l/bs
-            return l
-
-        weights = ch.ones_like(logits)
-        weights[charges == 0] = self.lmbd
-        weights[charges == 0] += (self.mu-self.lmbd)* hot1[charges == 0]
-        l = ch.nn.functional.binary_cross_entropy_with_logits(logits, hot1*charges[:, None], weight=weights, reduction='sum')
-        l = l/bs
+        l = l/bs # this way you only reduce over the batch size and not over the number of classes and batch size
         return l
+        
+        # weights = ch.ones_like(logits)
+        # weights[charges == 0] = self.lmbd
+        # weights[charges == 0] += (self.mu-self.lmbd)* hot1[charges == 0]
+        # return ch.nn.functional.binary_cross_entropy_with_logits(logits, hot1*charges[:, None], weight=weights, reduction='sum')
 
-class OneVsAllLoss(ch.nn.Module):
-    def __init__(self):
-        super(OneVsAllLoss, self).__init__()
-        self.bce_loss = ch.nn.BCEWithLogitsLoss()
-    
-    def forward(self, predictions, targets, _=None):
-        """
-        Args:
-            predictions: Raw logits from the model (B, num_classes)
-            targets: Ground truth labels as class indices (B,)
-        Returns:
-            loss: Mean binary cross-entropy loss across all classes
-        """
-        # Convert class indices to one-hot vectors
-        batch_size = targets.size(0)
-        num_classes = predictions.size(1)
-        
-        # Create one-hot encoding of targets
-        targets_one_hot = ch.zeros_like(predictions)
-        targets_one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
-        
-        # Calculate binary cross-entropy loss for each class
-        loss = self.bce_loss(predictions, targets_one_hot)
-        
-        return loss
 
 @param('loss.loss')
 @param('loss.mu')
@@ -198,12 +170,9 @@ def get_loss_fn(loss, mu, lmbd, label_smoothing, num_classes):
     if loss == 'sigmoid':
         return SigmoidLoss(mu, lmbd, num_classes)
     elif loss == 'ce':
-        return lambda x,y,z=None: ch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)(x,y) # Hacky but works
-    elif loss=='ova':
-        return OneVsAllLoss()
+        return ch.nn.CrossEntropyLoss(label_smoothing=label_smoothing) # Hacky but works
     else:
         raise ValueError(f'Unknown loss {loss}')
-
 class ImageNetTrainer:
     @param('training.distributed')
     def __init__(self, gpu, distributed):
@@ -317,22 +286,9 @@ class ImageNetTrainer:
             Squeeze(),
             ToDevice(ch.device(this_device), non_blocking=True),
         ]
-        charge_pipeline: List[Operation] = [
-            IntDecoder(),
-            ToTensor(),
-            Squeeze(),
-            ToDevice(ch.device(this_device), non_blocking=True),
-        ]
-        index_pipeline: List[Operation] = [
-            IntDecoder(),
-            ToTensor(),
-            Squeeze(),
-            ToDevice(ch.device(this_device), non_blocking=True),
-        ]
         pipelines = {
             "image": image_pipeline,
             "label": label_pipeline,
-            "charge": charge_pipeline,
         }
         order = OrderOption.RANDOM if distributed else OrderOption.QUASI_RANDOM
         loader = Loader(train_dataset,
@@ -364,7 +320,6 @@ class ImageNetTrainer:
             ToTorchImage(),
             NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float16)
         ]
-
         label_pipeline = [
             IntDecoder(),
             ToTensor(),
@@ -372,7 +327,6 @@ class ImageNetTrainer:
             ToDevice(ch.device(this_device),
             non_blocking=True)
         ]
-
         loader = Loader(val_dataset,
                         batch_size=batch_size,
                         num_workers=num_workers,
@@ -398,8 +352,7 @@ class ImageNetTrainer:
                     'train_loss': train_loss,
                     'epoch': epoch
                 }
-                if epoch % 5==0:
-                    self.eval_and_log(extra_dict)
+                self.eval_and_log(extra_dict)
 
         self.eval_and_log({'epoch':epoch})
         if self.gpu == 0:
@@ -415,7 +368,7 @@ class ImageNetTrainer:
                 'top_1': stats['top_1'],
                 'top_5': stats['top_5'],
                 'val_loss': stats['loss'],
-                'val_time': val_time
+                'val_time': val_time,
             }, **extra_dict)
             self.log(data)
             wandb.log(data)
@@ -454,7 +407,7 @@ class ImageNetTrainer:
         lrs = np.interp(np.arange(iters), [0, iters], [lr_start, lr_end])
 
         iterator = tqdm(self.train_loader)
-        for ix, (images, target, charges) in enumerate(iterator):
+        for ix, (images, target) in enumerate(iterator):
             ### Training start
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lrs[ix]
@@ -462,8 +415,8 @@ class ImageNetTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             with autocast('cuda'):
                 output = self.model(images)
-                loss_train = self.loss(output, target, charges)
-
+                loss_train = self.loss(output, target)
+                
             self.scaler.scale(loss_train).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -540,10 +493,13 @@ class ImageNetTrainer:
             lmbd = self.all_params['loss.lmbd']
             neg_counts = self.all_params["data.train_dataset"].split('_')[-1].split('.')[0]
             num_classes = ""
+            lr_schedule_type = self.all_params['lr.lr_schedule_type']
+            optimizer = self.all_params['training.optimizer']
+
             if self.all_params["data.num_classes"] == 100:
                 num_classes = "_100"
             
-            name = f'{negative_dataset_type}_{lr}_{mu}_{lmbd}_{neg_counts}_{experiment_name}{num_classes}'
+            name = f'{negative_dataset_type}_{lr}_{mu}_{lmbd}_{neg_counts}_{experiment_name}{num_classes}_{lr_schedule_type}_{optimizer}'
             """Initalizes a wandb run"""
             os.environ["WANDB__SERVICE_WAIT"] = "600"
             os.environ["WANDB_SILENT"] = "true"

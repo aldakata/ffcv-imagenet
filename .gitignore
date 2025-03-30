@@ -1,0 +1,7 @@
+__pycache__/
+results/
+job_logs_4/
+assets/
+wandb/
+*.ffcv
+*.png

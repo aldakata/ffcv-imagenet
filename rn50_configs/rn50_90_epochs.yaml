@@ -1,20 +1,22 @@
 data:
   in_memory: 1
-  num_workers: 8
+  num_workers: 12
 dist:
   world_size: 8
+logging:
+  folder: /tmp/
 model:
   arch: resnet50
 resolution:
-  end_ramp: 76
+  end_ramp: 78
   max_res: 192
   min_res: 160
-  start_ramp: 65
+  start_ramp: 66
 training:
   batch_size: 512
   bn_wd: 0
   distributed: 1
-  epochs: 88
+  epochs: 90
   label_smoothing: 0.1
   momentum: 0.9
   weight_decay: 0.0001

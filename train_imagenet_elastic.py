@@ -57,7 +57,9 @@ Section('data', 'data related stuff').params(
     val_dataset=Param(str, '.dat file to use for validation', required=True),
     num_workers=Param(int, 'The number of workers', required=True),
     in_memory=Param(int, 'does the dataset fit in memory? (1/0)', required=True),
-    num_classes=Param(int, 'num classes', default=1000)
+    num_classes=Param(int, 'num classes', default=1000),
+    processing=Param(int, 'class of processing, 0: none, 1: no duplicates', default=0),
+
 )
 
 Section('lr', 'lr scheduling').params(
@@ -95,7 +97,8 @@ Section('training', 'training hyper param stuff').params(
     epochs=Param(int, 'number of epochs', default=30),
     label_smoothing=Param(float, 'label smoothing parameter', default=0.1),
     distributed=Param(int, 'is distributed?', default=0),
-    use_blurpool=Param(int, 'use blurpool?', default=0)
+    use_blurpool=Param(int, 'use blurpool?', default=0),
+    negative_update=Param(int, 'update with neg loss?', default=1)
 )
 
 Section('dist', 'distributed training options').params(
@@ -116,7 +119,6 @@ DEFAULT_CROP_RATIO = 224/256
 def get_step_lr(epoch, lr, step_ratio, step_length, epochs):
     if epoch >= epochs:
         return 0
-
     num_steps = epoch // step_length
     return step_ratio**num_steps * lr
 @param('lr.lr')
@@ -151,45 +153,21 @@ class SigmoidLoss(ch.nn.Module):
         self.mu, self.lmbd = mu, lmbd
 
     def forward(self, logits, targets, charges=None):
+        if charges is None:
+            hot1 = F.one_hot(targets, num_classes=self.num_classes).float()
+            l = ch.nn.functional.binary_cross_entropy_with_logits(logits, hot1, reduction='sum')
+            bs = logits.size(0)
+            l = l/bs # this way you only reduce over the batch size and not over the number of classes and batch size
+            return l
+        
         hot1 = F.one_hot(targets, num_classes=self.num_classes).float()
         bs = logits.size(0)
-        if charges is None: # Ugly
-            l = ch.nn.functional.binary_cross_entropy_with_logits(logits, hot1)
-            l = l/bs
-            return l
-
         weights = ch.ones_like(logits)
         weights[charges == 0] = self.lmbd
-        weights[charges == 0] += (self.mu-self.lmbd)* hot1[charges == 0]
-        l = ch.nn.functional.binary_cross_entropy_with_logits(logits, hot1*charges[:, None], weight=weights, reduction='sum')
+        weights[charges == 0] += (self.mu-self.lmbd)*hot1[charges == 0]
+        l = ch.nn.functional.binary_cross_entropy_with_logits(logits, hot1*charges[:, None], weight=weights, reduction='none')
         l = l/bs
         return l
-
-class OneVsAllLoss(ch.nn.Module):
-    def __init__(self):
-        super(OneVsAllLoss, self).__init__()
-        self.bce_loss = ch.nn.BCEWithLogitsLoss()
-    
-    def forward(self, predictions, targets, _=None):
-        """
-        Args:
-            predictions: Raw logits from the model (B, num_classes)
-            targets: Ground truth labels as class indices (B,)
-        Returns:
-            loss: Mean binary cross-entropy loss across all classes
-        """
-        # Convert class indices to one-hot vectors
-        batch_size = targets.size(0)
-        num_classes = predictions.size(1)
-        
-        # Create one-hot encoding of targets
-        targets_one_hot = ch.zeros_like(predictions)
-        targets_one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
-        
-        # Calculate binary cross-entropy loss for each class
-        loss = self.bce_loss(predictions, targets_one_hot)
-        
-        return loss
 
 @param('loss.loss')
 @param('loss.mu')
@@ -199,39 +177,81 @@ def get_loss_fn(loss, mu, lmbd, label_smoothing, num_classes):
         return SigmoidLoss(mu, lmbd, num_classes)
     elif loss == 'ce':
         return lambda x,y,z=None: ch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)(x,y) # Hacky but works
-    elif loss=='ova':
-        return OneVsAllLoss()
     else:
         raise ValueError(f'Unknown loss {loss}')
 
 class ImageNetTrainer:
     @param('training.distributed')
-    def __init__(self, gpu, distributed):
+    @param('logging.experiment_name')
+    def __init__(self, gpu, distributed, experiment_name):
+        self.restart_count = int(os.environ.get("TORCHELASTIC_RESTART_COUNT", 0))
+        self.snapshot_path = f'/mnt/lustre/work/oh/owl156/tmp/snapshot_{experiment_name}.pt'      
         self.all_params = get_current_config()
         self.gpu = gpu
 
-        self.uid = str(uuid4())
         self.get_num_classes()
+
         if distributed:
             self.setup_distributed()
-
         self.train_loader = self.create_train_loader()
         self.val_loader = self.create_val_loader()
-        self.model, self.scaler = self.create_model_and_scaler()
+        self.model = self.create_model()
+        self.maybe_load_snapshot()
+        
+        self.model = self.model.to(memory_format=ch.channels_last)
+        self.model = self.model.to(self.gpu)
+        if distributed:
+            self.model = ch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu])
+
+        self.scaler = GradScaler()
         self.create_optimizer()
         self.initialize_logger()
-    
+
+    def _save_snapshot(self, epoch):
+        if self.gpu == 0:
+            snapshot = {}
+            snapshot["MODEL_STATE"] = self.model.module.state_dict()
+            snapshot["EPOCHS_RUN"] = epoch
+            snapshot["uid"] = self.uid
+            ch.save(snapshot, f"{self.snapshot_path}")
+            print(f"Epoch {epoch} | Training snapshot saved at{self.snapshot_path}")
+
+    def maybe_load_snapshot(self):
+        self.should_load() # check if first restart and prapare for it
+        # Load
+        if os.path.exists(self.snapshot_path) and self.restart_count > 0:
+            snapshot = ch.load(self.snapshot_path)
+            self.model.load_state_dict(snapshot["MODEL_STATE"])
+            self.epochs_run = snapshot["EPOCHS_RUN"]
+            self.uid = snapshot["uid"]
+            print(f"Resuming training from snapshot at Epoch {self.epochs_run} restart count {self.restart_count}")
+
+        # Normal Init
+        else:
+            self.uid = str(uuid4())
+            self.epochs_run = 0
+
+    def should_load(self):
+        self.restart_count = int(os.environ.get("TORCHELASTIC_RESTART_COUNT", 0))
+        # Make sure that there is no snapshot from another failed run
+        if self.restart_count == 0:
+            self.clean_snapshot()
+
+    def clean_snapshot(self):
+        if os.path.exists(self.snapshot_path) and self.gpu == 0:
+            os.remove(self.snapshot_path)
+
     @param('data.num_classes')
     def get_num_classes(self, num_classes):
         self.num_classes=num_classes
-        
+
     @param('dist.address')
     @param('dist.port')
     @param('dist.world_size')
     def setup_distributed(self, address, port, world_size):
-        os.environ['MASTER_ADDR'] = address
-        os.environ['MASTER_PORT'] = port
-        dist.init_process_group("nccl", rank=self.gpu, world_size=world_size, timeout=timedelta(seconds=1200)) # increased timeout 
+        # os.environ['MASTER_ADDR'] = address
+        # os.environ['MASTER_PORT'] = port
+        dist.init_process_group(backend="nccl", timeout=timedelta(seconds=1200))
         ch.cuda.set_device(self.gpu)
 
     def cleanup_distributed(self):
@@ -386,24 +406,28 @@ class ImageNetTrainer:
         return loader
 
     @param('training.epochs')
-    @param('logging.log_level')
+    @param('logging.log_level') 
     def train(self, epochs, log_level):
-        for epoch in range(epochs):
+        for epoch in range(self.epochs_run, epochs):
             res = self.get_resolution(epoch)
             self.decoder.output_size = (res, res)
-            train_loss = self.train_loop(epoch)
+            train_loss, loss_p, loss_n = self.train_loop(epoch)
 
             if log_level > 0:
                 extra_dict = {
                     'train_loss': train_loss,
+                    'loss_p': loss_p,
+                    'loss_n': loss_n,
                     'epoch': epoch
                 }
                 if epoch % 5==0:
+                    self._save_snapshot(epoch)
                     self.eval_and_log(extra_dict)
-
         self.eval_and_log({'epoch':epoch})
         if self.gpu == 0:
             ch.save(self.model.state_dict(), self.log_folder / 'final_weights.pt')
+        # remove tmp checkpoint
+        self.clean_snapshot()
 
     def eval_and_log(self, extra_dict={}):
         start_val = time.time()
@@ -413,7 +437,7 @@ class ImageNetTrainer:
             data = dict({
                 'current_lr': self.optimizer.param_groups[0]['lr'],
                 'top_1': stats['top_1'],
-                'top_5': stats['top_5'],
+                'top_5': stats.get('top_5',0),
                 'val_loss': stats['loss'],
                 'val_time': val_time
             }, **extra_dict)
@@ -425,8 +449,7 @@ class ImageNetTrainer:
     @param('model.pretrained')
     @param('training.distributed')
     @param('training.use_blurpool')
-    def create_model_and_scaler(self, arch, pretrained, distributed, use_blurpool):
-        scaler = GradScaler()
+    def create_model(self, arch, pretrained, distributed, use_blurpool):
         model = getattr(models, arch)(pretrained=pretrained,  num_classes=self.num_classes)
         def apply_blurpool(mod: ch.nn.Module):
             for (name, child) in mod.named_children():
@@ -435,20 +458,17 @@ class ImageNetTrainer:
                 else: apply_blurpool(child)
         if use_blurpool: apply_blurpool(model)
 
-        model = model.to(memory_format=ch.channels_last)
-        model = model.to(self.gpu)
-
-        if distributed:
-            model = ch.nn.parallel.DistributedDataParallel(model, device_ids=[self.gpu])
-
-        return model, scaler
+        return model
 
     @param('logging.log_level')
-    def train_loop(self, epoch, log_level):
+    @param('training.negative_update')
+    def train_loop(self, epoch, log_level, negative_update):
         model = self.model
         model.train()
         losses = []
-
+        losses_p = []
+        losses_n = []
+        
         lr_start, lr_end = self.get_lr(epoch), self.get_lr(epoch + 1)
         iters = len(self.train_loader)
         lrs = np.interp(np.arange(iters), [0, iters], [lr_start, lr_end])
@@ -463,7 +483,9 @@ class ImageNetTrainer:
             with autocast('cuda'):
                 output = self.model(images)
                 loss_train = self.loss(output, target, charges)
-
+                loss_pos = loss_train[charges==1].sum()
+                loss_neg = loss_train[charges==0].sum()
+                loss_train = loss_pos+negative_update*loss_neg
             self.scaler.scale(loss_train).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -472,7 +494,8 @@ class ImageNetTrainer:
             ### Logging start
             if log_level > 0:
                 losses.append(loss_train.detach())
-
+                losses_p.append(loss_pos.detach())
+                losses_n.append(loss_neg.detach())
                 group_lrs = []
                 for _, group in enumerate(self.optimizer.param_groups):
                     group_lrs.append(f'{group["lr"]:.3f}')
@@ -480,19 +503,22 @@ class ImageNetTrainer:
                 names = ['ep', 'iter', 'shape', 'lrs']
                 values = [epoch, ix, tuple(images.shape), group_lrs]
                 if log_level > 1:
-                    names += ['loss']
-                    values += [f'{loss_train.item():.3f}']
+                    names += ['loss', 'loss_p','loss_n']
+                    values += [f'{loss_train.item():.3f}', f'{loss_pos.item():.3f}', f'{loss_neg.item():.3f}']
 
                 msg = ', '.join(f'{n}={v}' for n, v in zip(names, values))
                 iterator.set_description(msg)
-        return ch.stack(losses).mean().item()
+        return ch.stack(losses).mean().item(), ch.stack(losses_p).mean().item(), ch.stack(losses_n).mean().item()
             ### Logging end
 
     @param('validation.lr_tta')
     def val_loop(self, lr_tta):
         model = self.model
         model.eval()
-
+        if self.num_classes>5:
+            topk = ['top_1', 'top_5']
+        else:
+            topk = ['top_1']
         with ch.no_grad():
             with autocast('cuda'):
                 for images, target in tqdm(self.val_loader):
@@ -500,7 +526,7 @@ class ImageNetTrainer:
                     if lr_tta:
                         output += self.model(ch.flip(images, dims=[3]))
 
-                    for k in ['top_1', 'top_5']:
+                    for k in topk:
                         self.val_meters[k](output, target)
 
                     loss_val = self.loss(output, target)
@@ -513,9 +539,15 @@ class ImageNetTrainer:
     @param('logging.folder')
     @param('logging.experiment_name')
     def initialize_logger(self, folder, experiment_name):
+        if self.num_classes>5:
+            tmp = {            
+                   'top_5': torchmetrics.Accuracy(task='multiclass', num_classes=self.num_classes, top_k=5).to(self.gpu)
+                   }
+        else:
+            tmp={}
         self.val_meters = {
             'top_1': torchmetrics.Accuracy(task='multiclass', num_classes=self.num_classes).to(self.gpu),
-            'top_5': torchmetrics.Accuracy(task='multiclass', num_classes=self.num_classes, top_k=5).to(self.gpu),
+            **tmp,
             'loss': MeanScalarMetric().to(self.gpu)
         }
 
@@ -542,7 +574,8 @@ class ImageNetTrainer:
             num_classes = ""
             if self.all_params["data.num_classes"] == 100:
                 num_classes = "_100"
-            
+            elif self.all_params["data.num_classes"] == 4:
+                num_classes = "_4"
             name = f'{negative_dataset_type}_{lr}_{mu}_{lmbd}_{neg_counts}_{experiment_name}{num_classes}'
             """Initalizes a wandb run"""
             os.environ["WANDB__SERVICE_WAIT"] = "600"
@@ -552,9 +585,11 @@ class ImageNetTrainer:
                 project='NegativeSamples1K',
                 dir='wandb/',
                 config=params,
-                name=name
+                name=name,
+                id=self.uid,
+                resume="allow",
             )
-    
+
     def log(self, content):
         print(f'=> Log: {content}')
         if self.gpu != 0: return
@@ -570,17 +605,10 @@ class ImageNetTrainer:
     @classmethod
     @param('training.distributed')
     @param('dist.world_size')
-    def launch_from_args(
-        cls, 
-        distributed, 
-        world_size, 
-        ):
-
-        if distributed:
-            ch.multiprocessing.set_start_method('forkserver', force=True)
-            ch.multiprocessing.spawn(cls._exec_wrapper, nprocs=world_size, join=True)
-        else:
-            cls.exec(0)
+    def launch_from_args(cls, distributed, world_size):
+        make_config(quiet=True)
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        cls.exec(local_rank)
 
     @classmethod
     def _exec_wrapper(cls, *args, **kwargs):
@@ -622,6 +650,7 @@ def make_config(quiet=False):
     config.augment_argparse(parser)
     config.collect_argparse_args(parser)
     config.validate(mode='stderr')
+    
     if not quiet:
         config.summary()
 

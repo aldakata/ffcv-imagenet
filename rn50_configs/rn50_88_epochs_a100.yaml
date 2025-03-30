@@ -1,8 +1,8 @@
 data:
-  in_memory: 1
+  in_memory: 0
   num_workers: 8
 dist:
-  world_size: 8
+  world_size: 1
 model:
   arch: resnet50
 resolution:
@@ -13,7 +13,7 @@ resolution:
 training:
   batch_size: 512
   bn_wd: 0
-  distributed: 1
+  distributed: 0
   epochs: 88
   label_smoothing: 0.1
   momentum: 0.9

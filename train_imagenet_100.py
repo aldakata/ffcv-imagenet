@@ -1,15 +1,11 @@
 import torch as ch
-from torch.amp import GradScaler
-from torch.amp import autocast
+from torch.cuda.amp import GradScaler
+from torch.cuda.amp import autocast
 import torch.nn.functional as F
 import torch.distributed as dist
 ch.backends.cudnn.benchmark = True
 ch.autograd.profiler.emit_nvtx(False)
 ch.autograd.profiler.profile(False)
-
-from datetime import timedelta
-
-import wandb
 
 from torchvision import models
 import torchmetrics
@@ -23,9 +19,6 @@ from uuid import uuid4
 from typing import List
 from pathlib import Path
 from argparse import ArgumentParser
-
-from functools import partial
-
 
 from fastargs import get_current_config
 from fastargs.decorators import param
@@ -56,28 +49,20 @@ Section('data', 'data related stuff').params(
     train_dataset=Param(str, '.dat file to use for training', required=True),
     val_dataset=Param(str, '.dat file to use for validation', required=True),
     num_workers=Param(int, 'The number of workers', required=True),
-    in_memory=Param(int, 'does the dataset fit in memory? (1/0)', required=True),
-    num_classes=Param(int, 'num classes', default=1000)
+    in_memory=Param(int, 'does the dataset fit in memory? (1/0)', required=True)
 )
 
 Section('lr', 'lr scheduling').params(
     step_ratio=Param(float, 'learning rate step ratio', default=0.1),
     step_length=Param(int, 'learning rate step length', default=30),
-    lr_schedule_type=Param(OneOf(['step', 'cyclic', 'eye']), default='cyclic'),
+    lr_schedule_type=Param(OneOf(['step', 'cyclic']), default='cyclic'),
     lr=Param(float, 'learning rate', default=0.5),
     lr_peak_epoch=Param(int, 'Epoch at which LR peaks', default=2),
 )
 
-Section('loss', 'loss function ablation').params(
-    loss=Param(OneOf(['ova', 'sigmoid', 'ce']), 'type of objective function', default='ce'),
-    mu=Param(float, 'weight of the negative heads class logits', default=0),
-    lmbd=Param(float, 'weight of the negative heads sigmoid loss', default=0),
-)
-
 Section('logging', 'how to log stuff').params(
     folder=Param(str, 'log location', required=True),
-    log_level=Param(int, '0 if only at end 1 otherwise', default=1),
-    experiment_name=Param(str, 'name of the experiment', required=True)
+    log_level=Param(int, '0 if only at end 1 otherwise', default=1)
 )
 
 Section('validation', 'Validation parameters stuff').params(
@@ -89,7 +74,7 @@ Section('validation', 'Validation parameters stuff').params(
 Section('training', 'training hyper param stuff').params(
     eval_only=Param(int, 'eval only?', default=0),
     batch_size=Param(int, 'The batch size', default=512),
-    optimizer=Param(And(str, OneOf(['sgd', 'adam'])), 'The optimizer', default='sgd'),
+    optimizer=Param(And(str, OneOf(['sgd'])), 'The optimizer', default='sgd'),
     momentum=Param(float, 'SGD momentum', default=0.9),
     weight_decay=Param(float, 'weight decay', default=4e-5),
     epochs=Param(int, 'number of epochs', default=30),
@@ -103,7 +88,6 @@ Section('dist', 'distributed training options').params(
     address=Param(str, 'address', default='localhost'),
     port=Param(str, 'port', default='12355')
 )
-
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406]) * 255
 IMAGENET_STD = np.array([0.229, 0.224, 0.225]) * 255
@@ -119,9 +103,6 @@ def get_step_lr(epoch, lr, step_ratio, step_length, epochs):
 
     num_steps = epoch // step_length
     return step_ratio**num_steps * lr
-@param('lr.lr')
-def get_eye_lr(epoch, lr):
-    return lr
 
 @param('lr.lr')
 @param('training.epochs')
@@ -144,66 +125,6 @@ class BlurPoolConv2d(ch.nn.Module):
                            groups=self.conv.in_channels, bias=None)
         return self.conv.forward(blurred)
 
-class SigmoidLoss(ch.nn.Module):
-    def __init__(self, mu, lmbd, num_classes):
-        super(SigmoidLoss, self).__init__()
-        self.num_classes = num_classes
-        self.mu, self.lmbd = mu, lmbd
-
-    def forward(self, logits, targets, charges=None):
-        hot1 = F.one_hot(targets, num_classes=self.num_classes).float()
-        bs = logits.size(0)
-        if charges is None: # Ugly
-            l = ch.nn.functional.binary_cross_entropy_with_logits(logits, hot1)
-            l = l/bs
-            return l
-
-        weights = ch.ones_like(logits)
-        weights[charges == 0] = self.lmbd
-        weights[charges == 0] += (self.mu-self.lmbd)* hot1[charges == 0]
-        l = ch.nn.functional.binary_cross_entropy_with_logits(logits, hot1*charges[:, None], weight=weights, reduction='sum')
-        l = l/bs
-        return l
-
-class OneVsAllLoss(ch.nn.Module):
-    def __init__(self):
-        super(OneVsAllLoss, self).__init__()
-        self.bce_loss = ch.nn.BCEWithLogitsLoss()
-    
-    def forward(self, predictions, targets, _=None):
-        """
-        Args:
-            predictions: Raw logits from the model (B, num_classes)
-            targets: Ground truth labels as class indices (B,)
-        Returns:
-            loss: Mean binary cross-entropy loss across all classes
-        """
-        # Convert class indices to one-hot vectors
-        batch_size = targets.size(0)
-        num_classes = predictions.size(1)
-        
-        # Create one-hot encoding of targets
-        targets_one_hot = ch.zeros_like(predictions)
-        targets_one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
-        
-        # Calculate binary cross-entropy loss for each class
-        loss = self.bce_loss(predictions, targets_one_hot)
-        
-        return loss
-
-@param('loss.loss')
-@param('loss.mu')
-@param('loss.lmbd')
-def get_loss_fn(loss, mu, lmbd, label_smoothing, num_classes):
-    if loss == 'sigmoid':
-        return SigmoidLoss(mu, lmbd, num_classes)
-    elif loss == 'ce':
-        return lambda x,y,z=None: ch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)(x,y) # Hacky but works
-    elif loss=='ova':
-        return OneVsAllLoss()
-    else:
-        raise ValueError(f'Unknown loss {loss}')
-
 class ImageNetTrainer:
     @param('training.distributed')
     def __init__(self, gpu, distributed):
@@ -211,7 +132,7 @@ class ImageNetTrainer:
         self.gpu = gpu
 
         self.uid = str(uuid4())
-        self.get_num_classes()
+
         if distributed:
             self.setup_distributed()
 
@@ -220,10 +141,6 @@ class ImageNetTrainer:
         self.model, self.scaler = self.create_model_and_scaler()
         self.create_optimizer()
         self.initialize_logger()
-    
-    @param('data.num_classes')
-    def get_num_classes(self, num_classes):
-        self.num_classes=num_classes
         
     @param('dist.address')
     @param('dist.port')
@@ -231,7 +148,8 @@ class ImageNetTrainer:
     def setup_distributed(self, address, port, world_size):
         os.environ['MASTER_ADDR'] = address
         os.environ['MASTER_PORT'] = port
-        dist.init_process_group("nccl", rank=self.gpu, world_size=world_size, timeout=timedelta(seconds=1200)) # increased timeout 
+
+        dist.init_process_group("nccl", rank=self.gpu, world_size=world_size)
         ch.cuda.set_device(self.gpu)
 
     def cleanup_distributed(self):
@@ -241,8 +159,7 @@ class ImageNetTrainer:
     def get_lr(self, epoch, lr_schedule_type):
         lr_schedules = {
             'cyclic': get_cyclic_lr,
-            'step': get_step_lr,
-            'eye': get_eye_lr,
+            'step': get_step_lr
         }
 
         return lr_schedules[lr_schedule_type](epoch)
@@ -270,9 +187,10 @@ class ImageNetTrainer:
     @param('training.optimizer')
     @param('training.weight_decay')
     @param('training.label_smoothing')
-    @param('lr.lr')
     def create_optimizer(self, momentum, optimizer, weight_decay,
-                         label_smoothing, lr):
+                         label_smoothing):
+        assert optimizer == 'sgd'
+
         # Only do weight decay on non-batchnorm parameters
         all_params = list(self.model.named_parameters())
         bn_params = [v for k, v in all_params if ('bn' in k)]
@@ -284,11 +202,9 @@ class ImageNetTrainer:
             'params': other_params,
             'weight_decay': weight_decay
         }]
-        if optimizer == 'sgd':
-            self.optimizer = ch.optim.SGD(param_groups, lr=1, momentum=momentum)
-        else:
-            self.optimizer = ch.optim.Adam(param_groups, lr=lr)
-        self.loss = get_loss_fn(label_smoothing=label_smoothing, num_classes=self.num_classes)
+
+        self.optimizer = ch.optim.SGD(param_groups, lr=1, momentum=momentum)
+        self.loss = ch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     @param('data.train_dataset')
     @param('data.num_workers')
@@ -311,29 +227,14 @@ class ImageNetTrainer:
             ToTorchImage(),
             NormalizeImage(IMAGENET_MEAN, IMAGENET_STD, np.float16)
         ]
+
         label_pipeline: List[Operation] = [
             IntDecoder(),
             ToTensor(),
             Squeeze(),
-            ToDevice(ch.device(this_device), non_blocking=True),
+            ToDevice(ch.device(this_device), non_blocking=True)
         ]
-        charge_pipeline: List[Operation] = [
-            IntDecoder(),
-            ToTensor(),
-            Squeeze(),
-            ToDevice(ch.device(this_device), non_blocking=True),
-        ]
-        index_pipeline: List[Operation] = [
-            IntDecoder(),
-            ToTensor(),
-            Squeeze(),
-            ToDevice(ch.device(this_device), non_blocking=True),
-        ]
-        pipelines = {
-            "image": image_pipeline,
-            "label": label_pipeline,
-            "charge": charge_pipeline,
-        }
+
         order = OrderOption.RANDOM if distributed else OrderOption.QUASI_RANDOM
         loader = Loader(train_dataset,
                         batch_size=batch_size,
@@ -341,8 +242,12 @@ class ImageNetTrainer:
                         order=order,
                         os_cache=in_memory,
                         drop_last=True,
-                        pipelines=pipelines,
+                        pipelines={
+                            'image': image_pipeline,
+                            'label': label_pipeline
+                        },
                         distributed=distributed)
+
         return loader
 
     @param('data.val_dataset')
@@ -398,8 +303,8 @@ class ImageNetTrainer:
                     'train_loss': train_loss,
                     'epoch': epoch
                 }
-                if epoch % 5==0:
-                    self.eval_and_log(extra_dict)
+
+                self.eval_and_log(extra_dict)
 
         self.eval_and_log({'epoch':epoch})
         if self.gpu == 0:
@@ -410,15 +315,13 @@ class ImageNetTrainer:
         stats = self.val_loop()
         val_time = time.time() - start_val
         if self.gpu == 0:
-            data = dict({
+            self.log(dict({
                 'current_lr': self.optimizer.param_groups[0]['lr'],
                 'top_1': stats['top_1'],
                 'top_5': stats['top_5'],
-                'val_loss': stats['loss'],
                 'val_time': val_time
-            }, **extra_dict)
-            self.log(data)
-            wandb.log(data)
+            }, **extra_dict))
+
         return stats
 
     @param('model.arch')
@@ -427,7 +330,7 @@ class ImageNetTrainer:
     @param('training.use_blurpool')
     def create_model_and_scaler(self, arch, pretrained, distributed, use_blurpool):
         scaler = GradScaler()
-        model = getattr(models, arch)(pretrained=pretrained,  num_classes=self.num_classes)
+        model = getattr(models, arch)(pretrained=pretrained,  num_classes=100)
         def apply_blurpool(mod: ch.nn.Module):
             for (name, child) in mod.named_children():
                 if isinstance(child, ch.nn.Conv2d) and (np.max(child.stride) > 1 and child.in_channels >= 16): 
@@ -454,17 +357,18 @@ class ImageNetTrainer:
         lrs = np.interp(np.arange(iters), [0, iters], [lr_start, lr_end])
 
         iterator = tqdm(self.train_loader)
-        for ix, (images, target, charges) in enumerate(iterator):
+        for ix, (images, target, _, _) in enumerate(iterator):
             ### Training start
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lrs[ix]
 
             self.optimizer.zero_grad(set_to_none=True)
-            with autocast('cuda'):
+            with autocast():
                 output = self.model(images)
-                loss_train = self.loss(output, target, charges)
+                loss_train = self.loss(output, target)
 
             self.scaler.scale(loss_train).backward()
+            ch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             ### Training end
@@ -485,7 +389,6 @@ class ImageNetTrainer:
 
                 msg = ', '.join(f'{n}={v}' for n, v in zip(names, values))
                 iterator.set_description(msg)
-        return ch.stack(losses).mean().item()
             ### Logging end
 
     @param('validation.lr_tta')
@@ -494,7 +397,7 @@ class ImageNetTrainer:
         model.eval()
 
         with ch.no_grad():
-            with autocast('cuda'):
+            with autocast():
                 for images, target in tqdm(self.val_loader):
                     output = self.model(images)
                     if lr_tta:
@@ -511,11 +414,10 @@ class ImageNetTrainer:
         return stats
 
     @param('logging.folder')
-    @param('logging.experiment_name')
-    def initialize_logger(self, folder, experiment_name):
+    def initialize_logger(self, folder):
         self.val_meters = {
-            'top_1': torchmetrics.Accuracy(task='multiclass', num_classes=self.num_classes).to(self.gpu),
-            'top_5': torchmetrics.Accuracy(task='multiclass', num_classes=self.num_classes, top_k=5).to(self.gpu),
+            'top_1': torchmetrics.Accuracy(task='multiclass', num_classes=100).to(self.gpu),
+            'top_5': torchmetrics.Accuracy(task='multiclass', num_classes=100, top_k=5).to(self.gpu),
             'loss': MeanScalarMetric().to(self.gpu)
         }
 
@@ -534,27 +436,6 @@ class ImageNetTrainer:
             with open(folder / 'params.json', 'w+') as handle:
                 json.dump(params, handle)
 
-            negative_dataset_type = self.all_params["data.train_dataset"].split('/')[-1].split('_')[0]
-            lr = self.all_params['lr.lr']
-            mu = self.all_params['loss.mu']
-            lmbd = self.all_params['loss.lmbd']
-            neg_counts = self.all_params["data.train_dataset"].split('_')[-1].split('.')[0]
-            num_classes = ""
-            if self.all_params["data.num_classes"] == 100:
-                num_classes = "_100"
-            
-            name = f'{negative_dataset_type}_{lr}_{mu}_{lmbd}_{neg_counts}_{experiment_name}{num_classes}'
-            """Initalizes a wandb run"""
-            os.environ["WANDB__SERVICE_WAIT"] = "600"
-            os.environ["WANDB_SILENT"] = "true"
-
-            wandb.init(
-                project='NegativeSamples1K',
-                dir='wandb/',
-                config=params,
-                name=name
-            )
-    
     def log(self, content):
         print(f'=> Log: {content}')
         if self.gpu != 0: return
@@ -565,19 +446,13 @@ class ImageNetTrainer:
                 'relative_time': cur_time - self.start_time,
                 **content
             }) + '\n')
-            # fd.flush() # albert ? 
+            fd.flush()
 
     @classmethod
     @param('training.distributed')
     @param('dist.world_size')
-    def launch_from_args(
-        cls, 
-        distributed, 
-        world_size, 
-        ):
-
+    def launch_from_args(cls, distributed, world_size):
         if distributed:
-            ch.multiprocessing.set_start_method('forkserver', force=True)
             ch.multiprocessing.spawn(cls._exec_wrapper, nprocs=world_size, join=True)
         else:
             cls.exec(0)
@@ -626,7 +501,5 @@ def make_config(quiet=False):
         config.summary()
 
 if __name__ == "__main__":
-    import warnings
-    warnings.filterwarnings("ignore")
     make_config()
     ImageNetTrainer.launch_from_args()
